@@ -1,0 +1,26 @@
+.trae/
+
+# Qt Creator local settings
+*.pro.user
+.qmake.stash
+
+# Build outputs
+release/
+debug/
+build/
+build-*/
+*.o
+*.obj
+*.exe
+*.dll
+*.a
+*.lib
+*.pdb
+*.ilk
+*.idb
+*.exp
+
+# Generated Qt files
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
