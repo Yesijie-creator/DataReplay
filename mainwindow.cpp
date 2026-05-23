@@ -303,20 +303,22 @@ void MainWindow::openDataFile()
 {
     const QString filePath = QFileDialog::getOpenFileName(
                 this,
-                QStringLiteral("选择原始数据文件"),
+                QStringLiteral("选择传感器文件"),
                 QStringLiteral("c:/Users/15528/Documents/qt/DataReplay"),
                 QStringLiteral("数据文件 (*.txt *.bin *.dat);;所有文件 (*.*)"));
     if (filePath.isEmpty()) {
         return;
     }
 
-    const ParseResult result = m_parser.parseFile(filePath);
+    const ParseResult result = m_parser.parseFile(filePath, m_hasMileageCorrectionTable ? &m_mileageCorrectionTable : nullptr);
     if (!result.errorMessage.isEmpty()) {
+        m_currentSensorFilePath.clear();
         resetUiState();
         QMessageBox::warning(this, QStringLiteral("解析失败"), result.errorMessage);
         return;
     }
 
+    m_currentSensorFilePath = filePath;
     setSamples(result, filePath);
 
     QString statusText = QStringLiteral("解析完成: C1=%1, C2=%2, 无效帧=%3")
@@ -353,6 +355,66 @@ void MainWindow::openDataFile()
                     .arg(formatTimestamp(result.hasLastC1Timestamp, result.lastC1TimestampMs))
                     .arg(result.parsedC2));
     }
+}
+
+void MainWindow::openMileageCorrectionFile()
+{
+    const QString filePath = QFileDialog::getOpenFileName(
+                this,
+                QStringLiteral("选择里程校正文件"),
+                QStringLiteral("c:/Users/15528/Documents/qt/DataReplay"),
+                QStringLiteral("Excel 文件 (*.xlsx)"));
+    if (filePath.isEmpty()) {
+        return;
+    }
+
+    MileageCorrectionTable correctionTable;
+    QString errorMessage;
+    if (!m_parser.loadMileageCorrectionFile(filePath, &correctionTable, &errorMessage)) {
+        QMessageBox::warning(this, QStringLiteral("读取失败"), errorMessage);
+        return;
+    }
+
+    ParseResult result;
+    if (!m_currentSensorFilePath.isEmpty()) {
+        result = m_parser.parseFile(m_currentSensorFilePath, &correctionTable);
+        if (!result.errorMessage.isEmpty()) {
+            QMessageBox::warning(this, QStringLiteral("里程校正失败"), result.errorMessage);
+            return;
+        }
+    }
+
+    m_currentMileageCorrectionFilePath = filePath;
+    m_mileageCorrectionTable = correctionTable;
+    m_hasMileageCorrectionTable = true;
+
+    if (!m_currentSensorFilePath.isEmpty()) {
+        setSamples(result, m_currentSensorFilePath);
+        const QString statusText = QStringLiteral("解析完成: C1=%1, C2=%2, 无效帧=%3")
+                .arg(result.parsedC1)
+                .arg(result.parsedC2)
+                .arg(result.invalidFrames);
+        m_topInfoItems = buildTopInfoItems(m_currentSensorFilePath, statusText, result.warningMessage);
+        m_statusInfoItems = buildStatusInfoItems(statusText, result.warningMessage);
+    } else {
+        m_topInfoItems = QStringList()
+                << QStringLiteral("未加载传感器文件")
+                << QStringLiteral("里程校正文件: %1").arg(m_currentMileageCorrectionFilePath);
+        m_statusInfoItems = QStringList()
+                << QStringLiteral("里程校正文件已加载，等待加载传感器文件")
+                << QStringLiteral("校正表工作表: %1，累计站点数: %2")
+                   .arg(m_mileageCorrectionTable.sheetName)
+                   .arg(m_mileageCorrectionTable.stations.size());
+    }
+
+    m_topInfoIndex = 0;
+    m_statusInfoIndex = 0;
+    updateTopInfoDisplay();
+    updateStatusInfoDisplay();
+    if (statusBar()) {
+        statusBar()->clearMessage();
+    }
+    updateInfoCarouselTimerState();
 }
 
 void MainWindow::togglePlayback()
@@ -531,7 +593,8 @@ void MainWindow::buildUi()
     rootLayout->setSpacing(10);
 
     QHBoxLayout *toolbarLayout = new QHBoxLayout;
-    m_openButton = new QPushButton(QStringLiteral("加载文件"), this);
+    m_openButton = new QPushButton(QStringLiteral("加载传感器文件"), this);
+    m_openMileageCorrectionButton = new QPushButton(QStringLiteral("加载里程校正文件"), this);
     m_playButton = new QPushButton(QStringLiteral("播放"), this);
     m_speedCombo = new QComboBox(this);
     m_speedCombo->addItem(QStringLiteral("0.5x"), 0.5);
@@ -545,14 +608,16 @@ void MainWindow::buildUi()
     m_speedCombo->setCurrentIndex(4);
     m_playbackSpeed = m_speedCombo->currentData().toDouble();
     connect(m_openButton, &QPushButton::clicked, this, &MainWindow::openDataFile);
+    connect(m_openMileageCorrectionButton, &QPushButton::clicked, this, &MainWindow::openMileageCorrectionFile);
     connect(m_playButton, &QPushButton::clicked, this, &MainWindow::togglePlayback);
     connect(m_speedCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::speedChanged);
 
-    m_topInfoLabel = new QLabel(QStringLiteral("未加载文件"), this);
+    m_topInfoLabel = new QLabel(QStringLiteral("未加载传感器文件"), this);
     m_topInfoLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     m_topInfoLabel->setWordWrap(false);
     m_topInfoLabel->installEventFilter(this);
     toolbarLayout->addWidget(m_openButton);
+    toolbarLayout->addWidget(m_openMileageCorrectionButton);
     toolbarLayout->addWidget(m_playButton);
     toolbarLayout->addWidget(new QLabel(QStringLiteral("倍速"), this));
     toolbarLayout->addWidget(m_speedCombo);
@@ -973,7 +1038,7 @@ void MainWindow::buildUi()
     initializePlotCarousels();
     updatePlaybackButtonText();
     updateFrameCostLabel();
-    m_statusCarouselLabel = new QLabel(QStringLiteral("等待加载原始数据文件"), this);
+    m_statusCarouselLabel = new QLabel(QStringLiteral("等待加载传感器文件"), this);
     m_statusCarouselLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     m_statusCarouselLabel->setWordWrap(false);
     m_statusCarouselLabel->installEventFilter(this);
@@ -1178,7 +1243,10 @@ QStringList MainWindow::buildTopInfoItems(const QString &filePath,
 {
     QStringList items;
     if (!filePath.isEmpty()) {
-        items << QStringLiteral("文件: %1").arg(filePath);
+        items << QStringLiteral("传感器文件: %1").arg(filePath);
+    }
+    if (m_hasMileageCorrectionTable && !m_currentMileageCorrectionFilePath.isEmpty()) {
+        items << QStringLiteral("里程校正文件: %1").arg(m_currentMileageCorrectionFilePath);
     }
     items.append(buildStatusInfoItems(summaryItem, warningMessage));
     return items;
@@ -1209,7 +1277,7 @@ void MainWindow::updateTopInfoDisplay()
     }
 
     const QString text = m_topInfoItems.isEmpty()
-            ? QStringLiteral("未加载文件")
+            ? QStringLiteral("未加载传感器文件")
             : m_topInfoItems.at(qBound(0, m_topInfoIndex, m_topInfoItems.size() - 1));
     m_topInfoLabel->setText(text);
     m_topInfoLabel->setToolTip(text);
@@ -1223,7 +1291,7 @@ void MainWindow::updateStatusInfoDisplay()
     }
 
     const QString text = m_statusInfoItems.isEmpty()
-            ? QStringLiteral("等待加载原始数据文件")
+            ? QStringLiteral("等待加载传感器文件")
             : m_statusInfoItems.at(qBound(0, m_statusInfoIndex, m_statusInfoItems.size() - 1));
     m_statusCarouselLabel->setText(text);
     m_statusCarouselLabel->setToolTip(text);
@@ -1248,8 +1316,14 @@ void MainWindow::updateInfoCarouselTimerState()
 
 void MainWindow::resetInfoCarouselState()
 {
-    m_topInfoItems = QStringList() << QStringLiteral("未加载文件");
-    m_statusInfoItems = QStringList() << QStringLiteral("等待加载原始数据文件");
+    m_topInfoItems = QStringList() << QStringLiteral("未加载传感器文件");
+    if (m_hasMileageCorrectionTable && !m_currentMileageCorrectionFilePath.isEmpty()) {
+        m_topInfoItems << QStringLiteral("里程校正文件: %1").arg(m_currentMileageCorrectionFilePath);
+    }
+    m_statusInfoItems = QStringList() << QStringLiteral("等待加载传感器文件");
+    if (m_hasMileageCorrectionTable && !m_currentMileageCorrectionFilePath.isEmpty()) {
+        m_statusInfoItems << QStringLiteral("里程校正文件已加载，等待加载传感器文件");
+    }
     m_topInfoIndex = 0;
     m_statusInfoIndex = 0;
     m_topInfoHovered = false;
