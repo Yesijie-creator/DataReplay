@@ -30,6 +30,10 @@ static constexpr double kBiasClosureResidualThresholdGs = 0.02;
 static constexpr double kSpeedZeroingAccelThresholdG = 0.008;
 static constexpr qint64 kSpeedZeroingStationaryDurationMs = 15000;
 static constexpr qint64 kSpeedZeroingCooldownMs = 60000;
+static constexpr double kApproxMetersPerGss = 9.8;
+static constexpr double kMileageCorrectionArrivalSpeedThresholdGs = 0.1;
+static constexpr qint64 kMileageCorrectionArrivalDurationMs = 5000;
+static constexpr double kMileageCorrectionUnlockSpeedThresholdGs = 1.0;
 static constexpr float kGroundGridCellSize = 5.0f;
 static constexpr float kTrainLength = 2.0f;
 static constexpr float kTrainWidth = kTrainLength * (1.55f / 3.05f);
@@ -464,12 +468,19 @@ MotionRebuildSummary rebuildDerivedMotion(ParseResult *result,
                                                           (kSpeedZeroingStationaryDurationMs
                                                            + boundedSampleIntervalMs - 1)
                                                           / boundedSampleIntervalMs);
+    const qint64 mileageCorrectionArrivalSamplesRequired = qMax<qint64>(1,
+                                                                        (kMileageCorrectionArrivalDurationMs
+                                                                         + boundedSampleIntervalMs - 1)
+                                                                        / boundedSampleIntervalMs);
     double accumulatedSpeedGs = 0.0;
     double accumulatedMileageZGss = 0.0;
+    double accumulatedMileageM = 0.0;
     qint64 consecutiveStationarySamples = 0;
+    qint64 consecutiveArrivalLowSpeedSamples = 0;
     int stationaryStartSampleIndex = -1;
     qint64 lastAppliedZeroingPlaybackMs = std::numeric_limits<qint64>::min();
     int nextCorrectionStationIndex = 0;
+    bool arrivalCorrectionLocked = false;
 
     result->mileageCorrectionApplied = false;
     result->mileageCorrectionStopCount = 0;
@@ -498,24 +509,16 @@ MotionRebuildSummary rebuildDerivedMotion(ParseResult *result,
                         double zeroedMileageZGss = zeroingStartIndex > 0
                                 ? result->samples.at(zeroingStartIndex - 1).derivedMileageZGss
                                 : 0.0;
-
-                        if (mileageCorrection && mileageCorrection->isValid()) {
-                            if (nextCorrectionStationIndex < mileageCorrection->stations.size()) {
-                                zeroedMileageZGss = mileageCorrection->stations
-                                        .at(nextCorrectionStationIndex)
-                                        .accumulatedUpMileageM;
-                                result->mileageCorrectionApplied = true;
-                                ++result->mileageCorrectionStopCount;
-                            } else {
-                                ++result->mileageCorrectionOverflowCount;
-                            }
-                            ++nextCorrectionStationIndex;
-                        }
+                        double zeroedMileageM = zeroingStartIndex > 0
+                                ? result->samples.at(zeroingStartIndex - 1).derivedMileageM
+                                : 0.0;
 
                         accumulatedMileageZGss = zeroedMileageZGss;
+                        accumulatedMileageM = zeroedMileageM;
                         for (int zeroIndex = zeroingStartIndex; zeroIndex <= index; ++zeroIndex) {
                             result->samples[zeroIndex].derivedSpeedZGs = 0.0;
                             result->samples[zeroIndex].derivedMileageZGss = zeroedMileageZGss;
+                            result->samples[zeroIndex].derivedMileageM = zeroedMileageM;
                         }
                     } else {
                         ++summary.stationaryZeroingRejectedCount;
@@ -534,9 +537,44 @@ MotionRebuildSummary rebuildDerivedMotion(ParseResult *result,
 
         if (sample.hasImu && sample.correctedImu.valid) {
             accumulatedMileageZGss += accumulatedSpeedGs * sampleIntervalSeconds;
+            accumulatedMileageM += accumulatedSpeedGs * sampleIntervalSeconds * kApproxMetersPerGss;
         }
+
+        if (sample.hasImu && sample.correctedImu.valid) {
+            if (accumulatedSpeedGs > kMileageCorrectionUnlockSpeedThresholdGs) {
+                arrivalCorrectionLocked = false;
+                consecutiveArrivalLowSpeedSamples = 0;
+            } else if (accumulatedSpeedGs < kMileageCorrectionArrivalSpeedThresholdGs) {
+                if (!arrivalCorrectionLocked) {
+                    ++consecutiveArrivalLowSpeedSamples;
+                }
+            } else {
+                consecutiveArrivalLowSpeedSamples = 0;
+            }
+        } else {
+            consecutiveArrivalLowSpeedSamples = 0;
+        }
+
+        if (!arrivalCorrectionLocked
+                && consecutiveArrivalLowSpeedSamples >= mileageCorrectionArrivalSamplesRequired
+                && mileageCorrection && mileageCorrection->isValid()) {
+            if (nextCorrectionStationIndex < mileageCorrection->stations.size()) {
+                accumulatedMileageM = mileageCorrection->stations
+                        .at(nextCorrectionStationIndex)
+                        .accumulatedUpMileageM;
+                result->mileageCorrectionApplied = true;
+                ++result->mileageCorrectionStopCount;
+            } else {
+                ++result->mileageCorrectionOverflowCount;
+            }
+            ++nextCorrectionStationIndex;
+            arrivalCorrectionLocked = true;
+            consecutiveArrivalLowSpeedSamples = 0;
+        }
+
         sample.derivedSpeedZGs = accumulatedSpeedGs;
         sample.derivedMileageZGss = accumulatedMileageZGss;
+        sample.derivedMileageM = accumulatedMileageM;
     }
 
     return summary;
@@ -661,22 +699,29 @@ void applyCorrectedAccelZ(ParseResult *result,
 
     if (mileageCorrection && mileageCorrection->isValid()) {
         appendWarningMessage(&result->warningMessage,
-                             QStringLiteral("已加载里程校正表：工作表 %1，共 %2 个站点累计里程")
+                             QStringLiteral("已加载里程校正表：工作表 %1，共 %2 个站点累计里程（米）")
                              .arg(mileageCorrection->sheetName)
                              .arg(mileageCorrection->stations.size()));
         if (result->mileageCorrectionApplied) {
             appendWarningMessage(&result->warningMessage,
-                                 QStringLiteral("已按到站停车事件应用 %1 次里程校正")
+                                 QStringLiteral("已按解算速度低于 %1 g*s 且持续 %2 s 的进站条件应用 %3 次里程校正")
+                                 .arg(QString::number(kMileageCorrectionArrivalSpeedThresholdGs, 'f', 1))
+                                 .arg(kMileageCorrectionArrivalDurationMs / 1000)
                                  .arg(result->mileageCorrectionStopCount));
         } else {
             appendWarningMessage(&result->warningMessage,
-                                 QStringLiteral("当前未检测到可用于里程校正的到站停车事件"));
+                                 QStringLiteral("当前未检测到可用于里程校正的进站条件：解算速度低于 %1 g*s 并持续 %2 s")
+                                 .arg(QString::number(kMileageCorrectionArrivalSpeedThresholdGs, 'f', 1))
+                                 .arg(kMileageCorrectionArrivalDurationMs / 1000));
         }
         if (result->mileageCorrectionOverflowCount > 0) {
             appendWarningMessage(&result->warningMessage,
                                  QStringLiteral("到站次数超出校正表范围 %1 次，后续保持原积分结果")
                                  .arg(result->mileageCorrectionOverflowCount));
         }
+        appendWarningMessage(&result->warningMessage,
+                             QStringLiteral("里程校正进站机制已启用上锁：触发后需解算速度超过 %1 g*s 才能再次触发")
+                             .arg(QString::number(kMileageCorrectionUnlockSpeedThresholdGs, 'f', 1)));
     }
 }
 

@@ -52,7 +52,7 @@ static constexpr float kRailThickness = 0.02f * kRailCrossSectionScale;
 static constexpr float kRailCenterOffsetX = kTrainWidth * 0.5f - kRailWidth * 0.5f;
 static constexpr float kPoseIndicatorHeight = kTrainLength;
 static constexpr float kPoseIndicatorRadius = kTrainLength * 0.16f;
-static constexpr qint64 kPoseIndicatorTrailWindowMs = 9000;
+static constexpr qint64 kPoseIndicatorTrailWindowMs = 4500;
 static constexpr qint64 kPoseIndicatorTrailMinSampleStepMs = 35;
 static constexpr float kPoseIndicatorTrailMinDistance = 0.015f;
 static constexpr float kPoseIndicatorTrailCoreHeadWidth = kTrainLength * 0.22f;
@@ -1184,8 +1184,11 @@ void PoseSimulationWidget::drawOverlay() const
 
     const QString speedText = QStringLiteral("解算速度(修正后Z轴积分): %1 g*s")
             .arg(QString::number(hasMovementSample ? m_sample.derivedSpeedZGs : 0.0, 'f', 3));
-    const QString mileageText = QStringLiteral("当前里程: %1 g*s*s")
-            .arg(QString::number(hasMovementSample ? m_sample.derivedMileageZGss : 0.0, 'f', 3));
+    const double mileageGss = hasMovementSample ? m_sample.derivedMileageZGss : 0.0;
+    const double mileageKm = hasMovementSample ? (m_sample.derivedMileageM / 1000.0) : 0.0;
+    const QString mileageText = QStringLiteral("当前里程: %1 g*s*s (%2 km)")
+            .arg(QString::number(mileageGss, 'f', 3))
+            .arg(QString::number(mileageKm, 'f', 3));
 
     const int motionBlockHeight = sectionTitleMetrics.height() + 8 + motionMetrics.lineSpacing() * 2;
     const int motionTop = contentBottom - motionBlockHeight;

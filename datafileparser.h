@@ -51,6 +51,7 @@ struct ReplaySample
     CorrectedImuSample correctedImu;
     double derivedSpeedZGs = 0.0;
     double derivedMileageZGss = 0.0;
+    double derivedMileageM = 0.0;
 
     double relativeEastM = 0.0;
     double relativeNorthM = 0.0;
